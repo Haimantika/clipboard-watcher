@@ -10,17 +10,19 @@ The intelligence is layered like this:
 
   * THIS FILE (laptop)              -> watches the clipboard, shows notifications
   * Hermes Agent (Nous Research)    -> orchestration + memory + the triage skill
-  * DeepSeek-V4-Flash               -> the actual reasoning behind each reaction
-  * DigitalOcean Serverless Inference -> hosts Flash (configured inside Hermes)
+  * GPT-5.4 Nano                    -> the actual reasoning behind each reaction
+  * DigitalOcean Serverless Inference -> hosts Nano (configured inside Hermes)
 
 Why this only works with a fast/cheap model: it fires on *every* copy event, so
-the model has to be quick and near-free per call. That is exactly V4-Flash's
-lane (13B active params, high throughput).
+the model has to be quick and near-free per call. GPT-5.4 Nano fits that lane
+and, unlike DeepSeek-V4-Flash (the original pick), reliably follows the
+"JSON-only" output contract the skill depends on.
 """
 
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -39,6 +41,14 @@ MIN_CHARS      = int(os.environ.get("CF_MIN_CHARS", "3"))          # ignore tiny
 MAX_CHARS      = int(os.environ.get("CF_MAX_CHARS", "8000"))       # sanity cap per clip
 HERMES_TIMEOUT = int(os.environ.get("CF_TIMEOUT", "45"))           # seconds per call
 
+# Notification Center banners depend on OS-level permission that's easy to
+# have silently un-granted (see README). Set CF_ALWAYS_ALERT=1 to *also* pop
+# a modal AppleScript alert dialog on every reaction -- alerts don't go
+# through Notification Center at all, so they always render, at the cost of
+# stealing focus. Handy for demos/recordings where you need guaranteed,
+# on-screen proof the reaction fired.
+ALWAYS_ALERT = os.environ.get("CF_ALWAYS_ALERT", "0") == "1"
+
 STATE_DIR = Path.home() / ".hermes" / "clipboard"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 CLIP_FILE = STATE_DIR / "current.txt"      # last clip, handy for debugging + memory
@@ -53,17 +63,57 @@ def log(msg: str) -> None:
 
 
 def notify(title: str, message: str) -> None:
-    """Best-effort cross-platform desktop notification."""
+    """Best-effort cross-platform desktop notification. Logs failures instead
+    of swallowing them, since a notification that silently doesn't show is
+    worse than no notification at all."""
     message = (message or "").strip()[:400]
     system = platform.system()
     try:
         if system == "Darwin":
-            subprocess.run(
-                ["osascript", "-e",
-                 f"display notification {json.dumps(message)} "
-                 f"with title {json.dumps(title)}"],
-                check=False,
-            )
+            # terminal-notifier is far more reliable than `osascript -e
+            # 'display notification'` -- it gets its own entry in System
+            # Settings -> Notifications (osascript's shows up as the vague
+            # "Script Editor" and is easy to have silently disabled/denied).
+            proc = None
+            if shutil.which("terminal-notifier"):
+                # Note: -sender is deliberately omitted -- newer
+                # terminal-notifier versions reject it outright since the
+                # UserNotifications framework no longer allows spoofing the
+                # calling bundle identity.
+                proc = subprocess.run(
+                    ["terminal-notifier", "-title", title, "-message", message],
+                    check=False, capture_output=True, text=True,
+                )
+                if proc.returncode != 0:
+                    log(f"terminal-notifier failed (rc={proc.returncode}): "
+                        f"{proc.stderr.strip()[:200]} -- falling back to osascript")
+                    proc = None
+            if proc is None:
+                # ensure_ascii=False matters here: the default \uXXXX escapes
+                # (e.g. for emoji in titles like "🔗 GitHub repo") aren't
+                # interpreted by AppleScript's string parser and break with a
+                # cryptic "Expected '\"' but found unknown token" error.
+                proc = subprocess.run(
+                    ["osascript", "-e",
+                     f"display notification {json.dumps(message, ensure_ascii=False)} "
+                     f"with title {json.dumps(title, ensure_ascii=False)}"],
+                    check=False, capture_output=True, text=True,
+                )
+            if proc.returncode != 0:
+                log(f"notify command failed (rc={proc.returncode}): "
+                    f"{proc.stderr.strip()[:200]}")
+            if ALWAYS_ALERT:
+                # `display alert` is a modal window, not a Notification
+                # Center banner -- it needs no special OS permission and will
+                # always render, which is why it's used here as a
+                # guaranteed-visible option rather than the default path.
+                subprocess.run(
+                    ["osascript", "-e",
+                     f"display alert {json.dumps(title, ensure_ascii=False)} "
+                     f"message {json.dumps(message, ensure_ascii=False)} "
+                     f"giving up after 8"],
+                    check=False, capture_output=True, text=True,
+                )
         elif system == "Linux" and shutil.which("notify-send"):
             subprocess.run(["notify-send", title, message], check=False)
         elif system == "Windows":
@@ -84,13 +134,35 @@ def notify(title: str, message: str) -> None:
 
 
 def extract_json(text: str):
-    """Pull the first {...} object out of Hermes' stdout."""
+    """Pull the first {...} object out of Hermes' stdout, tolerating markdown
+    code fences (```json ... ```) and stray prose around the object."""
+    text = text.strip()
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence:
+        try:
+            return json.loads(fence.group(1))
+        except json.JSONDecodeError:
+            pass
+
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end == -1 or end < start:
         return None
     try:
         return json.loads(text[start:end + 1])
     except json.JSONDecodeError:
+        # Retry against progressively smaller windows in case there's a
+        # second, malformed brace pair after the real JSON object.
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        return None
         return None
 
 
@@ -150,7 +222,7 @@ def main() -> None:
             log(f"skip: {len(text)} chars (over CF_MAX_CHARS={MAX_CHARS})")
             continue
 
-        log(f"clip changed ({len(text)} chars) -> Hermes / DS-V4-Flash...")
+        log(f"clip changed ({len(text)} chars) -> Hermes...")
         t0 = time.time()
         try:
             result = ask_hermes(text)

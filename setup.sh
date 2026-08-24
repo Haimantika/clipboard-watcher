@@ -12,30 +12,38 @@
 #
 set -euo pipefail
 
-# --- 1. laptop-side dependency ------------------------------------------------
+# --- 1. laptop-side dependencies ----------------------------------------------
 pip install --quiet pyperclip
 echo "✓ pyperclip installed"
 
-# --- 2. Hermes -> DigitalOcean Serverless Inference (DeepSeek-V4-Flash) --------
+# terminal-notifier is far more reliable than `osascript -e 'display
+# notification'` on modern macOS -- it gets its own entry in System Settings ->
+# Notifications, whereas osascript's shows up as the vague "Script Editor" and
+# is easy to have silently denied/disabled.
+if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
+  brew list terminal-notifier &>/dev/null || brew install terminal-notifier
+  echo "✓ terminal-notifier installed"
+  echo "  NOTE: the first notification may need approval in"
+  echo "  System Settings -> Notifications -> terminal-notifier (set to Allow)."
+fi
+
+# --- 2. Hermes -> DigitalOcean Serverless Inference ---------------------------
 : "${DO_MODEL_ACCESS_KEY:?Set it first:  export DO_MODEL_ACCESS_KEY=your-key}"
 
-# Discover the exact slug DigitalOcean uses for V4-Flash (slugs are lowercase-
-# hyphenated, e.g. openai-gpt-5.5). Don't guess — read it from the catalog:
-echo "Available DeepSeek slugs on DigitalOcean:"
+# Don't guess slugs (they change) — read them from the live catalog:
+echo "Available model slugs on DigitalOcean:"
 curl -s https://inference.do-ai.run/v1/models \
   -H "Authorization: Bearer ${DO_MODEL_ACCESS_KEY}" \
-  | grep -io '"id"[^,]*deepseek[^,]*' || echo "  (couldn't list — check your key)"
+  | grep -io '"id":[^,]*' || echo "  (couldn't list — check your key)"
 
-DO_MODEL_SLUG="${DO_MODEL_SLUG:-deepseek-v4-flash}"   # override if the slug above differs
+# deepseek-v4-flash was the original pick for speed/cost, but in practice it
+# frequently ignores the "JSON ONLY" instruction (prose, missing fields,
+# truncated output), so a lot of clips silently produce "no usable result".
+# GPT-5.4 Nano is just as fast/cheap on DO Serverless Inference and follows
+# the strict-JSON contract far more reliably. Override DO_MODEL_SLUG with any
+# id from the catalog above if you'd rather use something else.
+DO_MODEL_SLUG="${DO_MODEL_SLUG:-openai-gpt-5.4-nano}"
 
-# Point Hermes at DigitalOcean's OpenAI-compatible endpoint. DigitalOcean is just
-# a custom OpenAI-compatible provider as far as Hermes is concerned.
-#
-# NOTE: confirm these key names against YOUR Hermes version with `hermes config show`
-# — the provider namespace can vary. The values below are what matters:
-#   base_url = https://inference.do-ai.run/v1
-#   api_key  = your DO model access key   (Hermes routes this to ~/.hermes/.env)
-#   model    = <provider>/<do-slug>
 hermes config set providers.digitalocean.base_url "https://inference.do-ai.run/v1"
 hermes config set providers.digitalocean.api_key  "${DO_MODEL_ACCESS_KEY}"
 hermes config set model.default                   "digitalocean/${DO_MODEL_SLUG}"
